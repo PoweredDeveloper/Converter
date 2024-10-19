@@ -3,8 +3,11 @@ from psd_tools import PSDImage
 from threading import *
 
 # QT Imports
-from PySide6.QtGui import QColor, QBrush, QPixmap, QIcon
-from PySide6.QtWidgets import QFrame, QDialog, QGridLayout, QHBoxLayout, QVBoxLayout, QLabel, QGroupBox, QFileDialog, QPushButton, QTableWidget, QTableWidgetItem
+from PySide6.QtGui import QColor, QBrush, QPixmap, QIcon, QBrush, QCursor
+from PySide6.QtCore import QPoint, Signal, Qt, QRectF
+from PySide6.QtWidgets import QFrame, QDialog, QMessageBox, QGridLayout, QGraphicsView, QGraphicsScene, QHBoxLayout, QGraphicsPixmapItem, QVBoxLayout, QLabel, QGroupBox, QFileDialog, QPushButton, QTableWidget, QTableWidgetItem
+
+SCALE_FACTOR = 1.25
 
 def cutstr(string: str, length: int = 30) -> str:
     return '...' + string[-length:] if len(string) > length else string
@@ -44,6 +47,119 @@ def delete_with_extension(path: str, extension: str) -> None:
         if file.split('.')[-1] == extension:
             os.remove(os.path.join(path, file))
 
+def zip_directory(directory_path, zip_path):
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for root, dirs, files in os.walk(directory_path):
+            for file in files:
+                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), directory_path))
+
+class PhotoViewer(QGraphicsView):
+    coordinatesChanged = Signal(QPoint)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._zoom = 0
+        self._pinned = False
+        self._empty = True
+        self._scene = QGraphicsScene(self)
+        self._photo = QGraphicsPixmapItem()
+        self._photo.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+        self._scene.addItem(self._photo)
+        self.setScene(self._scene)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(QBrush(QColor(209, 209, 209)))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def hasPhoto(self):
+        return not self._empty
+
+    def resetView(self, scale=1):
+        rect = QRectF(self._photo.pixmap().rect())
+        if not rect.isNull():
+            self.setSceneRect(rect)
+            if (scale := max(1, scale)) == 1:
+                self._zoom = 0
+            if self.hasPhoto():
+                unity = self.transform().mapRect(QRectF(0, 0, 1, 1))
+                self.scale(1 / unity.width(), 1 / unity.height())
+                viewrect = self.viewport().rect()
+                scenerect = self.transform().mapRect(rect)
+                factor = min(viewrect.width() / scenerect.width(),
+                             viewrect.height() / scenerect.height()) * scale
+                self.scale(factor, factor)
+                if not self.zoomPinned():
+                    self.centerOn(self._photo)
+                self.updateCoordinates()
+
+    def setPhoto(self, pixmap=None):
+        if pixmap and not pixmap.isNull():
+            self._empty = False
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self._photo.setPixmap(pixmap)
+        else:
+            self._empty = True
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._photo.setPixmap(QPixmap())
+        if not (self.zoomPinned() and self.hasPhoto()):
+            self._zoom = 0
+        self.resetView(SCALE_FACTOR ** self._zoom)
+
+    def zoomLevel(self):
+        return self._zoom
+
+    def zoomPinned(self):
+        return self._pinned
+
+    def setZoomPinned(self, enable):
+        self._pinned = bool(enable)
+
+    def zoom(self, step):
+        zoom = max(0, self._zoom + (step := int(step)))
+        if zoom != self._zoom:
+            self._zoom = zoom
+            if self._zoom > 0:
+                if step > 0:
+                    factor = SCALE_FACTOR ** step
+                else:
+                    factor = 1 / SCALE_FACTOR ** abs(step)
+                self.scale(factor, factor)
+            else:
+                self.resetView()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        self.zoom(delta and delta // abs(delta))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resetView()
+
+    def toggleDragMode(self):
+        if self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        elif not self._photo.pixmap().isNull():
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def updateCoordinates(self, pos=None):
+        if self._photo.isUnderMouse():
+            if pos is None:
+                pos = self.mapFromGlobal(QCursor.pos())
+            point = self.mapToScene(pos).toPoint()
+        else:
+            point = QPoint()
+        self.coordinatesChanged.emit(point)
+
+    def mouseMoveEvent(self, event):
+        self.updateCoordinates(event.position().toPoint())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.coordinatesChanged.emit(QPoint())
+        super().leaveEvent(event)
+
 class Window(QDialog):
     def __init__(self):
         super().__init__()
@@ -59,20 +175,24 @@ class Window(QDialog):
 
         # Layouts & Widgets
         header = self.header()
-        table = self.compare_table()
+        self.table_box = self.compare_table()
         
         right_layout = QVBoxLayout()
-        preview = self.page_preview()
-        export = self.export()
-        right_layout.addWidget(preview)
-        right_layout.addWidget(export)
+        self.preview_pages = self.page_preview()
+        self.export_box = self.export()
+        right_layout.addWidget(self.preview_pages)
+        right_layout.addWidget(self.export_box)
 
         footer = self.footer()
+
+        self.table_box.setEnabled(False)
+        self.export_box.setEnabled(False)
+        self.preview_pages.setEnabled(False)
 
         # Main Layout
         main_layout = QGridLayout(self)
         main_layout.addLayout(header, 0, 0, 1, 2)
-        main_layout.addWidget(table, 1, 0)
+        main_layout.addWidget(self.table_box, 1, 0)
         main_layout.addLayout(right_layout, 1, 1)
         main_layout.addLayout(footer, 2, 0, 1, 2)
 
@@ -83,7 +203,7 @@ class Window(QDialog):
         result = QHBoxLayout()
         label = QLabel("<i>by Mikis (Powered Developer) &lt;<a href='https://github.com/PoweredDeveloper'>https://github.com/PoweredDeveloper</a>&gt;</i>")
         label.setOpenExternalLinks(True)
-        result.addWidget(QLabel('v0.1'))
+        result.addWidget(QLabel('v0.2'))
         result.addStretch(1)
         result.addWidget(label)
         return result
@@ -182,7 +302,7 @@ class Window(QDialog):
         vertical_layout.addLayout(self.pages_layout)
 
         return result
-    
+
     def preview(self, type: str, page: int = 1, color: QColor = QColor(209, 209, 209)) -> QFrame:
         filename = None
         if type != 'blank':
@@ -200,16 +320,15 @@ class Window(QDialog):
         else:
             pixmap = QPixmap(os.path.join(os.getcwd(), 'buffer', type, filename))
 
-        pixmap = pixmap.scaledToHeight(600)
-
         frame = QFrame()
         frame.setFixedSize(400, 600)
 
-        page = QLabel(frame)
-        page.setPixmap(pixmap)
+        viewer = PhotoViewer(frame)
+        viewer.setPhoto(pixmap)
+        viewer.setFixedSize(400, 600)
 
         return frame
-    
+
     def update_pages(self, page: int = 1) -> None:
         if page > len(self.pages['initial']) or page <= 0: return
         self.page = page
@@ -231,6 +350,7 @@ class Window(QDialog):
         layout = QHBoxLayout(result)
 
         export_btn = QPushButton('Export')
+        export_btn.clicked.connect(self.export_file)
         export_btn.setMinimumHeight(40)
         export_btn.setMinimumWidth(140)
 
@@ -243,7 +363,7 @@ class Window(QDialog):
         layout.addWidget(export_btn)
 
         return result
-    
+
     def select_save_path(self, button: QPushButton) -> None:
         dialog = QFileDialog(self)
         dialog.setWindowTitle("Choose Location, where Zip will be saved")
@@ -256,6 +376,32 @@ class Window(QDialog):
             if filenames:
                 self.export_path = filenames[0]
                 button.setText(cutstr(self.export_path, 90))
+
+    def export_file(self) -> None:
+        if self.export_path == '': return
+
+        result_path = os.path.join(os.getcwd(), 'buffer', 'result')
+        os.mkdir(result_path)
+
+        for file in os.listdir(os.path.join(os.getcwd(), 'buffer', 'initial')):
+            shutil.copy(os.path.join(os.getcwd(), 'buffer', 'initial', file), result_path)
+
+        for file in os.listdir(os.path.join(os.getcwd(), 'buffer', 'corrected')):
+            shutil.copy(os.path.join(os.getcwd(), 'buffer', 'corrected', file), result_path)
+
+        zip_directory(result_path, 'result.zip')
+        
+        if os.path.exists(os.path.join(self.export_path, 'result.zip')):
+            shutil.move(os.path.join(os.getcwd(), 'result.zip'), os.path.join(self.export_path, 'result.zip'))
+        else:
+            shutil.move(os.path.join(os.getcwd(), 'result.zip'), self.export_path)
+
+        msg = QMessageBox()
+        msg.setWindowTitle("Export")
+        msg.setText("Archive was successfully exported")
+        msg.setWindowIcon(QIcon(os.path.join(os.getcwd(), 'assets', 'icon.png')))
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
         
     def proceed_project(self) -> None:
         if list(self.archives.values()).count('') > 0: return
@@ -283,6 +429,10 @@ class Window(QDialog):
         self.pages['corrected'] = sort_pages(os.listdir(os.path.join(os.getcwd(), 'buffer', 'corrected')))
         self.pages['corrected'] = [self.pages['initial'][i] if self.pages['corrected'].count(self.pages['initial'][i]) > 0 else 'N/A' for i in range(len(self.pages['initial']))]
         
+        self.table_box.setEnabled(True)
+        self.export_box.setEnabled(True)
+        self.preview_pages.setEnabled(True)
+
         self.update()
 
     def update(self) -> None:
@@ -316,4 +466,4 @@ class Window(QDialog):
 
         for file in os.listdir(corrected_dir):
             if file.split('.')[-1] == 'psd':
-                os.remove(os.path.join(corrected_dir, file))
+                os.remove(os.path.join(corrected_dir, file))    
